@@ -145,6 +145,65 @@
         .cinema-active:hover {
             cursor: default;
         }
+
+        /* Auto-Play Countdown Overlay */
+        .autoplay-overlay {
+            position: absolute;
+            bottom: 80px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.9);
+            border: 1px solid #333;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 50;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            animation: slideUp 0.3s ease-out;
+        }
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .autoplay-circle {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            border: 4px solid #333;
+            border-top-color: var(--primary-color, #e50914);
+            animation: spin 1s linear infinite;
+        }
+
+        /* Theme Variables */
+        :root {
+            --primary-color: #e50914;
+            --primary-hover: #b20710;
+        }
+
+        /* Apply variables to common accents */
+        .text-red-600, .text-red-500 { color: var(--primary-color) !important; }
+        .bg-red-600, .bg-red-500 { background-color: var(--primary-color) !important; }
+        .border-red-600, .border-red-500 { border-color: var(--primary-color) !important; }
+        .hover\\:bg-red-600:hover, .hover\\:bg-red-700:hover { background-color: var(--primary-hover) !important; }
+        .hover\\:text-red-600:hover { color: var(--primary-color) !important; }
+        .focus\\:border-red-600:focus { border-color: var(--primary-color) !important; }
+        .focus\\:ring-red-600:focus { --tw-ring-color: var(--primary-color) !important; }
+
+        /* Compact Mode Styles */
+        .compact-row {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 0.75rem;
+            background: #1f2937;
+            border-radius: 0.5rem;
+            transition: background 0.2s;
+        }
+        .compact-row:hover {
+            background: #374151;
+        }
     </style>
 </head>
 <body class="min-h-screen flex flex-col">
@@ -356,11 +415,20 @@
         // Note: AnimeFLV provider in Consumet often lacks /genre and /top-airing endpoints, 
         // so we will adapt the logic to use Search for everything.
         const API_MIRRORS = [
-            'https://consumet-api-2.vercel.app/anime/animeflv',
-            'https://consumet-jade-eta.vercel.app/anime/animeflv',
-            'https://animet-api.vercel.app/anime/animeflv',
+            // Prioridad: API oficial primero
             'https://api.consumet.org/anime/animeflv',
-            'https://c.delusionz.xyz/anime/animeflv'
+
+            // Mirrors comunitarios (pueden caer/volver)
+            'https://consumet-api-psi.vercel.app/anime/animeflv',
+            'https://consumet-api-2.vercel.app/anime/animeflv',
+            'https://consumet-jade-eta.vercel.app/anime/animeflv'
+        ];
+
+        // Fallbacks si el navegador bloquea CORS (muy común si abres el HTML como file://)
+        const CORS_PROXIES = [
+            (url) => url,
+            (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+            (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
         ];
 
         const GENRES = [
@@ -372,6 +440,7 @@
         const app = {
             state: {
                 apiIndex: 0,
+                activeProxyIndex: 0,
                 currentAnime: null,
                 currentHls: null,
                 sliderInterval: null,
@@ -552,77 +621,117 @@
             updateApiStatus: () => {
                 const el = document.getElementById('apiStatus');
                 if (!el) return;
-                const host = new URL(API_MIRRORS[app.state.apiIndex]).hostname;
-                el.innerText = `Servidor: ${host}`;
+
+                const mirror = API_MIRRORS[app.state.apiIndex];
+                const host = new URL(mirror).hostname;
+                const proxyIdx = app.state.activeProxyIndex ?? 0;
+                const proxyLabel = proxyIdx === 0 ? 'directo' : (proxyIdx === 1 ? 'corsproxy' : 'allorigins');
+
+                el.innerText = `Servidor: ${host} (${proxyLabel})`;
                 el.classList.remove('text-green-400');
             },
 
             manualSwitchApi: () => {
                 app.state.apiIndex = (app.state.apiIndex + 1) % API_MIRRORS.length;
+                app.state.activeProxyIndex = 0;
                 app.updateApiStatus();
                 alert(`Cambiando a servidor alternativo: ${API_MIRRORS[app.state.apiIndex]}`);
                 app.loadHome();
             },
 
+            retryConnection: async () => {
+                try {
+                    const prevPage = app.state.page;
+                    app.state.page = 1;
+                    await app.request('SEARCH', 'Naruto');
+                    app.state.page = prevPage;
+                    app.loadHome(false);
+                } catch (e) {
+                    console.warn('Retry failed:', e);
+                    app.showError('No pudimos conectar con el servidor.');
+                }
+            },
+
             async request(type, param) {
+                const page = app.state.page;
+
+                const buildUrl = (baseUrl) => {
+                    switch (type) {
+                        case 'TOP':
+                        case 'SEARCH':
+                        case 'GENRE':
+                            return `${baseUrl}/${encodeURIComponent(param || 'anime')}?page=${page}`;
+                        case 'INFO':
+                            return `${baseUrl}/info/${param}`;
+                        case 'STREAM':
+                            return `${baseUrl}/watch/${param}`;
+                        default:
+                            return baseUrl;
+                    }
+                };
+
+                const fetchWithTimeout = async (url, timeoutMs = 10000) => {
+                    const ctrl = new AbortController();
+                    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+                    try {
+                        const res = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+                        return res;
+                    } finally {
+                        clearTimeout(t);
+                    }
+                };
+
+                let lastErr = null;
+
                 for (let i = 0; i < API_MIRRORS.length; i++) {
                     const idx = (app.state.apiIndex + i) % API_MIRRORS.length;
                     const baseUrl = API_MIRRORS[idx];
-                    let url = '';
-                    const page = app.state.page;
+                    const rawUrl = buildUrl(baseUrl);
 
-                    // ADAPTATION: The AnimeFLV provider in Consumet often crashes on /genre/ and /top-airing/.
-                    // We map these to standard Search queries to ensure stability.
-                    switch (type) {
-                        case 'TOP': 
-                            // Instead of /top-airing, we search for a mix of popular terms if the first fails
-                            // But here we define the URL structure. The 'param' for TOP will be ignored or used as fallback keyword
-                            url = `${baseUrl}/${encodeURIComponent(param || 'anime')}?page=${page}`; 
-                            break;
-                        case 'SEARCH': 
-                            url = `${baseUrl}/${encodeURIComponent(param)}?page=${page}`; 
-                            break;
-                        case 'GENRE': 
-                            // AnimeFLV Consumet endpoint usually doesn't have /genre/. 
-                            // We use search instead, searching the genre name.
-                            url = `${baseUrl}/${encodeURIComponent(param)}?page=${page}`; 
-                            break;
-                        case 'INFO': 
-                            url = `${baseUrl}/info/${param}`; 
-                            break;
-                        case 'STREAM': 
-                            url = `${baseUrl}/watch/${param}`; 
-                            break;
-                    }
+                    for (let p = 0; p < CORS_PROXIES.length; p++) {
+                        const finalUrl = CORS_PROXIES[p](rawUrl);
 
-                    try {
-                        const response = await fetch(url);
-                        if (!response.ok) throw new Error(`Status ${response.status}`);
-                        return await response.json();
-                    } catch (err) {
-                        console.warn(`Mirror ${idx} failed.`);
-                        if (i === API_MIRRORS.length - 1) throw new Error("All public mirrors failed");
-                        app.state.apiIndex = (idx + 1) % API_MIRRORS.length;
-                        app.updateApiStatus();
+                        try {
+                            console.log('[API] Trying:', finalUrl);
+                            const response = await fetchWithTimeout(finalUrl, 12000);
+                            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                            const json = await response.json();
+
+                            // Success: set active mirror and show status
+                            app.state.apiIndex = idx;
+                            app.state.activeProxyIndex = p;
+                            app.updateApiStatus();
+
+                            return json;
+                        } catch (err) {
+                            lastErr = err;
+                            console.warn('[API] Failed:', finalUrl, err);
+                            // continue trying next proxy/mirror
+                        }
                     }
                 }
+
+                throw new Error(`All public mirrors failed: ${lastErr?.message || 'unknown error'}`);
             },
 
             async fetchTopAiring() {
                 // Since there is no reliable "Top Airing" endpoint for AnimeFLV,
-                // we simulate it by searching for currently popular keywords.
-                const keywords = ['2024', 'action', 'aventura', 'shonen', 'isekai'];
-                // Select a keyword based on minute to rotate content slightly or just fixed
+                // we simulate it by searching for currently popular keywords that return many results.
+                const keywords = ['Jujutsu', 'One Piece', 'Demon Slayer', 'Bleach', 'Naruto', 'Dragon Ball', 'Solo Leveling'];
                 const keyword = keywords[Math.floor(Math.random() * keywords.length)];
                 
                 try {
-                    // We pass the keyword to the TOP case which maps to search
                     const data = await app.request('TOP', keyword);
-                    return data.results || data; 
+                    // Filter to ensure we have images
+                    const results = (data.results || data || []).filter(a => a.image);
+                    if (results.length === 0) throw new Error("No results");
+                    return results; 
                 } catch (e) {
-                    // Ultimate fallback
+                    console.warn("Home fallback used");
                     try {
-                        const data = await app.request('SEARCH', 'dragon ball'); 
+                        // Ultimate fallback: Search for "Anime" to get anything
+                        const data = await app.request('SEARCH', 'Anime'); 
                         return data.results || [];
                     } catch (err) { return []; }
                 }
@@ -722,14 +831,34 @@
             },
 
             showError: (msg) => {
+                const mirror = API_MIRRORS[app.state.apiIndex] || '';
+                const host = mirror ? new URL(mirror).hostname : 'desconocido';
+                const proxyIdx = app.state.activeProxyIndex ?? 0;
+                const proxyLabel = proxyIdx === 0 ? 'directo' : (proxyIdx === 1 ? 'corsproxy' : 'allorigins');
+
                 document.getElementById('app').innerHTML = `
-                    <div class="text-center py-20">
+                    <div class="text-center py-20 max-w-2xl mx-auto">
                         <i class="fa-solid fa-circle-exclamation text-4xl text-red-600 mb-4"></i>
                         <h2 class="text-xl font-bold mb-2">Ops, hubo un problema</h2>
-                        <p class="text-gray-400 mb-6">${msg}</p>
-                        <button onclick="app.loadHome()" class="bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700 transition cursor-pointer">
-                            Reintentar
-                        </button>
+                        <p class="text-gray-300 mb-2">${msg}</p>
+                        <p class="text-gray-500 text-sm mb-6">Servidor actual: <span class="text-gray-300 font-mono">${host}</span> (<span class="text-gray-300">${proxyLabel}</span>)</p>
+
+                        <div class="bg-gray-900/50 border border-gray-800 rounded-xl p-4 text-left text-sm text-gray-400 mb-6">
+                            <div class="font-bold text-gray-300 mb-2">Consejo rápido</div>
+                            <ul class="list-disc pl-5 space-y-1">
+                                <li>Si abriste el archivo como <span class="font-mono text-gray-300">file://</span>, algunos navegadores bloquean las peticiones. Ábrelo con un servidor local (ej: <span class="font-mono text-gray-300">npx serve</span> o <span class="font-mono text-gray-300">python -m http.server</span>).</li>
+                                <li>Prueba cambiar de servidor con el botón del footer.</li>
+                            </ul>
+                        </div>
+
+                        <div class="flex flex-col sm:flex-row gap-3 justify-center">
+                            <button onclick="app.retryConnection()" class="bg-red-600 text-white px-6 py-2 rounded hover:bg-red-700 transition cursor-pointer">
+                                Reintentar
+                            </button>
+                            <button onclick="app.manualSwitchApi()" class="bg-gray-800 text-white px-6 py-2 rounded hover:bg-gray-700 transition cursor-pointer">
+                                Cambiar servidor
+                            </button>
+                        </div>
                     </div>`;
             },
 
@@ -835,9 +964,20 @@
                 document.getElementById('app').innerHTML = html;
             },
 
-            init: () => {
+            init: async () => {
                 app.renderGenres();
                 app.updateApiStatus();
+
+                // Auto-select fastest working mirror/proxy to avoid first-load failure
+                try {
+                    const prevPage = app.state.page;
+                    app.state.page = 1;
+                    await app.request('SEARCH', 'Naruto');
+                    app.state.page = prevPage;
+                } catch (e) {
+                    console.warn('Warmup failed:', e);
+                }
+
                 app.loadHome();
                 
                 // Bind Mode buttons
